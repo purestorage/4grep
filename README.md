@@ -165,7 +165,7 @@ The index location may be overridden with the `--indexdir` option.
  
  
 ## 4grep Log
-When 4grep finishes its search, certain statistics will be recorded in 4grep's own log file. This will help to spot patterns between searches and hopefully optimize for the 90% case in the future.
+When 4grep finishes its search, certain statistics will be recorded in 4grep's own log file. This will help to spot patterns between searches and hopefully optimize for the 90% case in the future. This logfile is stored in /path/to/index/.4grep.log.
  
  
 ## Other Tools Used by 4grep
