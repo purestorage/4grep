@@ -1,0 +1,691 @@
+#!/usr/bin/env python
+from __future__ import print_function
+from distutils.spawn import find_executable
+from multiprocessing.pool import ThreadPool
+from ctypes.util import find_library
+from contextlib import contextmanager
+from collections import deque
+from subprocess import PIPE
+from Queue import Empty
+
+import multiprocessing as mp
+import subprocess
+import threading
+import itertools
+import argparse
+import tempfile
+import getpass
+import shutil
+import signal
+import ctypes as ct
+import errno
+import math
+import time
+import sys
+import os
+import re
+
+NGRAM_CHARS = 5
+TGREP_DIR = os.path.dirname(os.path.realpath(__file__))
+MODULE_PATHS = [os.path.join(TGREP_DIR, module_name)
+		for module_name in ("bitmap/4grep.so", "4grep.so")]
+REGEX_METACHARACTERS = r".^$*+?{}[]\|()"
+ESCAPED_REGEX_METACHARACTERS = re.escape(REGEX_METACHARACTERS)
+
+try:
+	module_path = next(m for m in MODULE_PATHS if os.path.isfile(m))
+except StopIteration:
+	module_path = find_library("4grep")
+	if module_path is None:
+		print("4grep: Error: 4grep.so not found")
+		sys.exit(-1)
+
+class intarray(ct.Structure):
+	_fields_ = [("length", ct.c_int), ("data", ct.POINTER(ct.c_int))]
+
+class intarrayarray(ct.Structure):
+	_fields_ = [("num_rows", ct.c_int), ("rows", ct.POINTER(intarray))]
+
+mymod = ct.cdll.LoadLibrary(module_path)
+
+strings_to_sorted_indices = mymod.strings_to_sorted_indices
+strings_to_sorted_indices.argtypes = [ct.POINTER(ct.c_char_p), ct.c_int]
+strings_to_sorted_indices.restype = intarray
+
+start_filter = mymod.start_filter
+start_filter.argtypes = [intarrayarray, ct.c_char_p, ct.c_char_p]
+start_filter.restype = ct.c_int
+
+pack = mymod.pack_loose_files
+pack.argtypes = [ct.c_char_p]
+
+get_index_directory = mymod.get_index_directory
+get_index_directory.restype = ct.c_char_p
+
+HELP = '''\033[1m4grep\033[0m: fast grep using multiple cpus and 4gram filter
+
+\033[1mSIMPLE USAGE\033[0m
+	4grep <regex> <filelist>
+	find <args> | 4grep <regex>
+
+\033[1mADVANCED USAGE\033[0m
+	4grep --filter <filter string> <regex> <filelist>
+	4grep --filter <filter string1> --filter <filter string2> <regex> <filelist>
+	4grep <regex> <filelist> --cores N --indexdir path/to/index
+
+\033[1mOPTIONAL ARGUMENTS\033[0m
+	--filter 		specify a filter string
+	--cores			limit number of cores used
+	--excludes		exclude files and directories by regex
+	--indexdir		specify directory to store index
+
+\033[1mDESCRIPTION\033[0m
+	For standard use, 4grep takes in two parameters: a non-regex string
+	and the list of files. The string is first used to filter out files that
+	have no instances of the string anywhere in the file. It will the grep using
+	the string to find the lines where the string exists.
+
+	The more advanced uses breaks down the standard case. You can specify the
+	filter string and regex seperately. The filter string will be used to
+	filter any files that have no instances of the string anywhere in the file.
+	The regex is then passed onto grep for these subset of files and will give
+	you the lines which contain the regex.
+
+	Hence an advanced usage of 4grep may be that the list of files are first
+	filtered so that only files that have a certain string remain. Then the
+	regex will grep for lines that contain something else.
+
+	[--cores] was added to limit the number of cores that 4grep uses. If not
+	specified, or too large, the program will use the maximum number of cores -1.
+
+\033[1mEXAMPLES\033[0m
+	$ 4grep WARNING foo/bar/log.gz
+	This will search for WARNING in the file 'log.gz', first filtering then grep
+
+	$ 4grep --filter WARNING [0-9] foo/bar/log.gz
+	This is more advanced use. First the list of files will be filtered so that
+	only files with the string 'WARNING' remain. Then the regex '[0-9]'
+	will be used to grep and so any line that contains a number, in this subset
+	of files, will be printed.
+
+	$ 4grep --exclude='bar|fizz' 'STACKTRACE' foo///.log
+	This will search all of the files matching the regex
+	.*foo.*/.*/.*/.*.log.* and exclude all directories named 'bar' or
+	'fizz'.
+
+\033[1mNOTES\033[0m
+	- Filter strings are auto-detected from the regex in simple cases.
+	- Filter strings must be at least 5 characters
+	- Filter strings do not support regex yet and so are parsed as a
+	  literal string
+	'''
+
+def run_pack_process(*args):
+	ignore_sigint()
+	pack(*args)
+
+
+# adapted from answers at https://stackoverflow.com/questions/5081657/
+@contextmanager
+def redirect(from_file, to_file):
+	"""
+	Redirects output to from_file's file descriptor into to_file's
+	descriptor.
+
+	For example, the following redirects stdout to stderr:
+
+		import sys, os
+
+		with redirect(sys.stdout, sys.stderr):
+			print('Hello, world!')  # outputs to stderr
+			os.system("echo hello world")  # also outputs to stderr
+
+	from_file is flushed when entering and to_file is flushed when exiting
+	the context to make sure userspace buffers don't write to the wrong
+	place.
+
+	You probably don't want to write to both from_file and to_file under
+	this context.
+	"""
+	# backup from_file fd by dup'ing it
+	from_fd = from_file.fileno()
+	dup_from_fd = os.dup(from_fd)
+
+	from_file.flush()
+
+	# replace from_file fd with to_file dup fd
+	os.dup2(to_file.fileno(), from_fd)
+	try:
+		yield
+	finally:
+		# restore original from_file fd
+		os.dup2(dup_from_fd, from_fd)
+		# get rid of backup from_file fd
+		os.close(dup_from_fd)
+
+		to_file.flush()
+
+def filter_and_grep_worker_func(in_queue, out_queue, options, regex, index,
+                                index_dir, quit_flag):
+	ignore_sigint()
+	tp = ThreadPool(1)
+	while not quit_flag.value:
+		try:
+			item = in_queue.get(timeout=1)
+			if item is None:
+				return
+			(i, f) = item
+			result = tp.apply_async(
+				do_filter_and_grep, (i, options, regex,
+					f, index, index_dir))
+			while not result.ready():
+				result.wait(1.0)
+				if quit_flag.value:
+					tp.terminate()
+					return
+			out_queue.put(result.get())
+		except Empty:
+			pass
+
+def do_filter_and_grep(i, options, regex, f, index=None, index_dir=None):
+	BTMP_MTCH = 1
+	BTMP_NOMTCH = 2
+	NOBTMP_MTCH = 3 #never gets used since default
+	NOBTMP_NOMTCH = 4
+	bitmapped = filtered = False
+	err = output = ""
+
+	if index and not index.empty():
+		assert index_dir is not None
+		index_dir_char_p = ct.c_char_p(index_dir)
+		c_filename = ct.c_char_p(f)
+		filter_struct = index.get_index_struct()
+		with tempfile.TemporaryFile() as temp:
+			with redirect(sys.stderr, temp):
+				ret = start_filter(
+					filter_struct, c_filename,
+					index_dir_char_p)
+			temp.seek(0)
+			err = temp.read()
+
+		bitmapped = ret == BTMP_MTCH or ret == BTMP_NOMTCH
+		filtered = ret == NOBTMP_NOMTCH or ret == BTMP_NOMTCH
+
+	if not filtered:
+		output, grep_err = do_grep(options, regex, f)
+		err += grep_err
+	return (i, output, err, (bitmapped, filtered))
+
+def do_grep(options, regex, f):
+	grep = ["zgrep"] + options + ["--"] + [regex, f]
+	# see https://blog.nelhage.com/2010/02/a-very-subtle-bug/
+	# or http://bugs.python.org/issue1652 for why we need to handle SIGPIPE
+	default_sigpipe = lambda: signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+	p = subprocess.Popen(grep, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+			     preexec_fn=default_sigpipe)
+	output, err = p.communicate()
+	return (output, err)
+
+def print_progress_bar(progress, done, tracelog):
+	total_files = progress.total_files
+	count = progress.count
+	elapsed = time.time() - progress.init_time
+	mins, secs = divmod(elapsed, 60)
+	if total_files == 0:
+		return
+
+	if count == 0:
+		print('>{bold}Done:{end}{:5.1f}% of {}{}{end} '
+		      '{bold}Elapsed:{end}{:g}m{:>04.1f}s{}'.format(
+		      0, progress.color, total_files,
+		      mins, secs, Color.CLEAR_END+Color.UP, bold=Color.BOLD,
+		      end=Color.END), file=sys.stderr)
+		return
+
+	remain = (total_files-count)*elapsed/count
+	mins2, secs2 = divmod(remain, 60)
+	bitmapped_p = progress.bitmapped*100.0/count
+	filtered_p = progress.filtered*100.0/count
+
+	if not done:
+		done_p = math.floor(count*1000.0/total_files)/10
+		print('>{bold}Done:{end}{:5.1f}% of {}{}{end} '
+		      '{bold}Elapsed:{end}{:g}m{:>04.1f}s '
+		      '{bold}Bitmapped:{end}{:5.1f}% '
+		      '{bold}Filtered:{end}{:5.1f}% '
+		      '{bold}ETA:{end}{:g}m{:>04.1f}s{}'.format(
+		      done_p, progress.color, total_files, mins, secs,
+		      bitmapped_p, filtered_p, mins2, secs2, Color.CLEAR_END+Color.UP,
+		      bold=Color.BOLD, end=Color.END), file=sys.stderr)
+
+	if done:
+		print('>{bold}{}Finished:{end}{} files '
+		      '{bold}Elapsed:{end}{:g}m{:>04.1f}s '
+		      '{bold}Bitmapped:{end}{:5.1f}% '
+		      '{bold}Filtered:{end}{:5.1f}%{}'.format(
+		      Color.GREEN, total_files, mins, secs, bitmapped_p,
+		      filtered_p, Color.CLEAR_END, bold=Color.BOLD, end=Color.END), file=sys.stderr)
+		tracelog.bitmapped = bitmapped_p
+		tracelog.filtered = filtered_p
+		tracelog.total_files = total_files
+		tracelog.elapsed = elapsed
+		print_to_log(tracelog)
+
+
+def print_accumulated(progress):
+	if progress.printed in progress.gout:
+		print(Color.CLEAR_LINE, end='', file=sys.stderr)
+	while progress.printed in progress.gout:
+		output = progress.gout[progress.printed]
+		print(output, end='')
+		progress.printed += 1
+
+def start_pack_process(progress, bitmap_store_dir_char_p):
+	if progress.pack_process:
+		progress.pack_process.join()
+	progress.pack_process = mp.Process(
+			target=run_pack_process,
+			args=(bitmap_store_dir_char_p,))
+	progress.pack_process.start()
+
+def handle_results(result_queue, progress, index_dir):
+	while not result_queue.empty():
+		update_progress(result_queue.get(timeout=1), progress, index_dir)
+	output_progress(progress)
+
+def update_progress(result, progress, bitmap_store_dir_char_p):
+	i, output, err, b = result
+	if err:
+		progress.error_queue.append(err)
+	progress.bitmapped += b[0]
+	progress.filtered += b[1]
+	progress.gout[i] = output
+	progress.count += 1
+	if ((progress.count % 1000 == 0) or (progress.count == \
+	    progress.total_files)) and not (progress.pack_process.is_alive()):
+		start_pack_process(progress, bitmap_store_dir_char_p)
+
+
+def output_progress(progress):
+	while len(progress.error_queue) != 0:
+		err = progress.error_queue.popleft()
+		print(Color.CLEAR_LINE, end='', file=sys.stderr)
+		print(err, end='', file=sys.stderr)
+	print_accumulated(progress)
+	print_progress_bar(progress, False, None)
+
+def queue_generator(queue, generator):
+	for item in generator:
+		queue.append(item)
+	queue.append(None)
+
+class Color:
+	GREEN = '\033[92m'
+	RED = '\033[91m'
+	BOLD = '\033[1m'
+	END = '\033[0m'
+	UP = '\033[F'
+	CLEAR_END = '\033[K'
+	CLEAR_LINE = '\x1b[2K'
+
+class SearchProgress(object):
+	def __init__(self):
+		self.init_time = 0
+		self.count = 0
+		self.bitmapped = 0
+		self.filtered = 0
+		self.printed = 0
+		self.total_files = 0
+		self.gout = {}
+		self.color = Color.RED + Color.BOLD
+		self.pack_process = None
+		self.error_queue = deque()
+
+
+def ignore_sigint():
+	signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+def smp_loop(options, files, index, tracelog):
+	index_dir = tracelog.indexdir_abs
+	progress = SearchProgress()
+	progress.init_time = tracelog.init_time
+	file_queue = deque()
+	file_queueing_thread = threading.Thread(target=queue_generator,
+	                                        args=(file_queue, files))
+	file_queueing_thread.daemon = True
+	file_queueing_thread.start()
+	cores = min(mp.cpu_count()-1, tracelog.cores) if tracelog.cores \
+		else mp.cpu_count() - 1
+	print('{bold}using {} cores{end}\n'.format(cores, bold=Color.BOLD,
+		      end=Color.END), file=sys.stderr)
+	filter_and_grep_work_input_queue = mp.Queue()
+	output_queue = mp.Queue()
+	quit_flag = mp.Value("i", 0)
+	processes = [mp.Process(
+		target=filter_and_grep_worker_func,
+		args=(filter_and_grep_work_input_queue, output_queue, options,
+			tracelog.regex, index, index_dir, quit_flag))
+		for i in range(cores)]
+	for p in processes:
+		p.daemon = True
+		p.start()
+	try:
+		start_pack_process(progress, index_dir)
+		work_queued = 0
+		while True:
+			while len(file_queue) == 0:
+				handle_results(output_queue, progress, index_dir)
+				time.sleep(0.1)
+			f = file_queue.popleft()
+			if f == None:
+				break
+			if not os.path.exists(f):
+				print(Color.CLEAR_LINE + '4grep: {}: No such file or directory'.format(f),
+						file=sys.stderr)
+				continue
+			if os.path.isdir(f):
+				print(Color.CLEAR_LINE + '4grep: {}: Is a directory'.format(f),
+						file=sys.stderr)
+				continue
+			progress.total_files = len(file_queue) + work_queued
+			filter_and_grep_work_input_queue.put((work_queued, f))
+			handle_results(output_queue, progress, index_dir)
+			work_queued += 1
+		for _ in range(cores):
+			filter_and_grep_work_input_queue.put(None)
+		progress.total_files = work_queued
+		progress.color = Color.GREEN + Color.BOLD
+		for p in processes:
+			while p.is_alive():
+				handle_results(output_queue, progress,
+						index_dir)
+				time.sleep(0.1)
+		handle_results(output_queue, progress, index_dir)
+		if progress.count != 0:
+			print_progress_bar(progress, True, tracelog)
+		else:
+			print(Color.CLEAR_LINE + '4grep: no files found', file=sys.stderr)
+	except KeyboardInterrupt:
+		ignore_sigint()  # prevent interruption of interrupt handling
+		print(file=sys.stderr)
+		print(Color.END + "Aborting 4grep...", file=sys.stderr)
+		quit_flag.value = 1
+		empty_queue(filter_and_grep_work_input_queue)
+		for p in processes:
+			p.join()
+		sys.exit(1)
+
+def empty_queue(queue):
+	while not queue.empty():
+		try:
+			queue.get_nowait()
+		except Empty:
+			pass
+
+class stdin_iter:
+	def __init__(self):
+		pass
+
+	def __iter__(self):
+		return self
+
+	def next(self):
+		ret = sys.stdin.readline().strip()
+		if not ret:
+			raise StopIteration
+		return ret
+
+class regex_iter:
+	def __init__(self, regex, excludes):
+		self.regex = [".*"+r+".*" for r in regex.split("/")]
+		self.level = 0
+		self.height = len(self.regex) - 1
+		self.ls = ['' for r in self.regex]
+		self.ls[0] = sorted([f for f in os.listdir('.')
+		                    if re.match(self.regex[0], f)])
+		self.excludes = excludes
+
+	def __iter__(self):
+		return self
+
+	def walkup(self):
+		while self.level and not self.ls[self.level]:
+			self.level -= 1
+		if self.level == 0 and not self.ls[0]:
+			raise StopIteration
+
+	def next(self):
+		def dirlist(l):
+			return [f for f in l if os.path.isdir(f)]
+
+		def filelist(l):
+			return [f for f in l if os.path.isfile(f)]
+
+		self.walkup()
+		while self.level < self.height:
+			dir = self.ls[self.level].pop(0)
+			self.level += 1
+			self.ls[self.level] = sorted([dir+'/'+ f for f in os.listdir(dir)
+			                             if re.match(self.regex[self.level],
+			                                         f)])
+			if self.excludes:
+				self.ls[self.level] = [f for f in self.ls[self.level]
+									   if not re.match(self.excludes, f)]
+
+			if self.level < self.height:
+				self.ls[self.level] = dirlist(self.ls[self.level])
+			else:
+				self.ls[self.level] = filelist(self.ls[self.level])
+			self.walkup()
+		return self.ls[self.level].pop(0)
+
+def intersect(a, b):
+	return list(set(a) & set(b))
+
+def get_index_from_regex(regex):
+	"""
+	Parsing a regex is hard.
+	But there are some low-hanging fruits that can satisfy most usecases.
+	"""
+	non_regex_metachar = "[^{}]".format(ESCAPED_REGEX_METACHARACTERS)
+	parsable_metachar = r"(\.\*?|\+)"
+	# 'parsable': things we can parse an ANDed index from
+	parsable = "({}|{})".format(non_regex_metachar, parsable_metachar)
+	# first low-hanging fruit: does grabbing all non-metachars work?
+	if re.match("^{}+$".format(parsable), regex):
+		literals = re.split("{}+".format(parsable_metachar), regex)
+		long_enough = (l for l in literals if len(l) >= NGRAM_CHARS)
+		return StringIndex([long_enough])
+	# second: is it a series of the above |'d together?
+	elif re.match(r"^{0}+(\|{0}+)+$".format(parsable), regex):
+		subexprs = regex.split("|")
+		sub_indices = tuple(get_index_from_regex(r) for r in subexprs)
+		if any(s.empty() for s in sub_indices):
+			return empty_index()
+		string_sets = tuple(ind.strings[0] for ind in sub_indices)
+		return StringIndex(string_sets)
+	# third: is it safe to just grab string literals from the start/end?
+	if any(x in regex for x in ('|', '?', '*', '{,', '{0')):
+		return empty_index()
+	start = re.match("^{}+".format(non_regex_metachar), regex)
+	end = re.search("{}+$".format(non_regex_metachar), regex)
+	if start and end:
+		start = start.group()
+		end = end.group()
+		return StringIndex([[start]] if start == end else [[start, end]])
+	elif start:
+		return StringIndex([[start.group()]])
+	elif end:
+		return StringIndex([[end.group()]])
+	return empty_index()
+
+class StringIndex(object):
+	""" Represents a search index.
+
+	strings: a list of lists of strings.
+	The inner lists of strings will be ANDed together, and the outer lists
+	will all be ORed together.
+
+	For example,
+		StringIndex([["one", "two"], "three"])
+	represents the index matching ("one" AND "two") OR "three"
+	"""
+	def __init__(self, strings):
+		strings = tuple(strings)
+		self.strings = tuple(tuple(
+				s for s in sublist if len(s) >= NGRAM_CHARS)
+			for sublist in strings)
+		if any(len(s) == 0 for s in self.strings):
+			self.strings = ()
+
+	def empty(self):
+		return len(self.strings) == 0
+
+	def get_index_struct(self):
+		""" Returns a struct suitable for passing to our C code as an
+		index.
+		"""
+		intarrays = []
+		assert not self.empty()
+		for ss in self.strings:
+			assert len(ss) != 0
+			assert not any(len(s) < NGRAM_CHARS for s in ss)
+			char_p_p = (ct.c_char_p * len(ss)) (*ss)
+			intarrays.append(strings_to_sorted_indices(char_p_p, len(ss)))
+		iaa = intarrayarray()
+		iaa.num_rows = len(intarrays)
+		iaa.rows = (intarray * len(intarrays)) (*intarrays)
+		return iaa
+
+	def __str__(self):
+		return ' OR '.join(
+			' AND '.join(s for s in ss)
+			for ss in self.strings)
+
+	def __eq__(self, other):
+		return type(self) is type(other) \
+				and self.strings == other.strings
+
+	def __ne__(self, other):
+		return not self.__eq__(other)
+
+	def __repr__(self):
+		return "StringIndex({})".format(str(self))
+
+def empty_index():
+	return StringIndex([])
+
+def get_index(args):
+	""" Returns a StringIndex parsed from the args.
+
+	If --filter was specified, it uses args.filter, else it uses
+	args.regex.
+	"""
+	if args.filter is not None:
+		indices = [s for s in args.filter if len(s) >= NGRAM_CHARS]
+		if len(indices) == 0:
+			print("{bold}4grep: cannot filter on {} (too short) {end} "
+					.format(args.filter, bold=Color.BOLD, end=Color.END), file=sys.stderr, end='')
+			return empty_index()
+		else:
+			return StringIndex([indices])
+	else:
+		index = get_index_from_regex(args.regex)
+		if index.empty():
+			print("{bold}4grep: cannot detect filter for '{}' {end} "
+					.format(args.regex, bold=Color.BOLD, end=Color.END), file=sys.stderr, end='')
+
+	if not index.empty():
+		print('{bold}4grep filtering on {} {end}'.format(index, bold=Color.BOLD,
+		      end=Color.END), file=sys.stderr, end='')
+	return index
+
+class TraceLog(object):
+	def __init__(self):
+		self.user = getpass.getuser()
+		self.init_time = time.time()
+		self.end_time = 0
+		self.filtered = 0
+		self.bitmapped = 0
+		self.total_files = 0
+		self.elapsed = 0
+		self.regex = None
+		self.exclude = None
+		self.cores = None
+		self.filter = None
+		self.indexdir = None
+		self.indexdir_abs = None
+
+def print_to_log(tracelog):
+	# Keep .4grep.log hidden or will be packed
+	file_name = tracelog.indexdir_abs + "/.4grep.log"
+	exists = os.path.exists(file_name)
+	datetime = time.gmtime(tracelog.init_time)
+	elapsed = tracelog.elapsed
+	with open(file_name, 'a') as f:
+		if not exists:
+			f.write("t_end\tuser\tt_elapsed\ttotal_files\t%_filtered\t%_bitmapped"
+			        "\tregex\t--exclude\t--cores\t--filter\t--indexdir\n")
+		elapsed = tracelog.elapsed
+		f.write("{}/{}/{} {}:{}:{}\t{}\t{:.2f}\t{:.0f}\t{:.2f}\t{:.2f}\t{}\t{}\t{}\t{}\t{}\n".format(
+		        datetime[1], datetime[2], datetime[0], datetime[3], datetime[4], datetime[5],
+		        tracelog.user, elapsed, tracelog.total_files, tracelog.filtered, tracelog.bitmapped,
+		        tracelog.regex, tracelog.exclude, tracelog.cores, tracelog.filter, tracelog.indexdir))
+	if not exists:
+		os.chmod(file_name, 0o666)
+
+
+def main():
+	tracelog = TraceLog()
+
+	parser = argparse.ArgumentParser("4grep", usage=HELP, add_help=False)
+	parser.add_argument('regex', metavar='REGEX', type=str)
+	parser.add_argument('files', metavar='FILE', type=str, nargs='*')
+	parser.add_argument('--exclude', type=str)
+	parser.add_argument('--cores', type=int)
+	parser.add_argument('--filter', action='append', type=str)
+	parser.add_argument('--indexdir', type=str)
+	parser.add_argument('--help', action="help")
+	args, options = parser.parse_known_args()
+
+	tracelog.regex = args.regex
+	tracelog.exclude = args.exclude
+	tracelog.cores = args.cores
+	tracelog.filter = args.filter
+	tracelog.indexdir = args.indexdir
+
+	filelist = args.files
+	# hack to handle mixed flags and filenames, because argparse doesn't
+	filelist.extend(opt for opt in options if opt[0] != '-')
+	options = [opt for opt in options if opt[0] == '-']
+	index = get_index(args)
+	tracelog.indexdir_abs = os.path.abspath(os.path.expanduser(os.path.expandvars(
+			args.indexdir if args.indexdir is not None
+			else get_index_directory())))
+
+	# smart default for -h vs. -H
+	if intersect(("-h", "-H", "--with-filename", "--no-filename"), options):
+		# explicitly set by caller
+		pass
+	elif len(filelist) == 1 and os.path.isfile(filelist[0]):
+		options.append("-h")
+	else:
+		options.append("-H")
+
+	if not filelist:
+		# read filelist from stdin instead
+		filelist = stdin_iter()
+	elif (len(filelist) == 1) and not os.path.isfile(filelist[0]):
+		filelist = regex_iter(filelist[0], args.exclude)
+
+	smp_loop(options, filelist, index, tracelog)
+
+if __name__ == "__main__":
+	try:
+		main()
+	except IOError as e:
+		if e.errno == errno.EPIPE:
+			pass
+	except KeyboardInterrupt:
+		pass
+

@@ -1,0 +1,13 @@
+.*.swp
+.*.swo
+*.orig
+*.DS_Store
+**/*~
+**/*.pyc
+4grepc
+debian/4grep
+debian/4grep.substvars
+debian/4grep.debhelper.log
+debian/files
+debian/debhelper-build-stamp
+compile_commands.json

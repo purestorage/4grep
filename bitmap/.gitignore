@@ -1,0 +1,4 @@
+packfile
+test
+*.o
+*.so

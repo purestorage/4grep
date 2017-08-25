@@ -1,0 +1,12 @@
+Source: 4grep
+Maintainer: Matthew Pfeiffer <mpfeiffer@purestorage.com>
+Build-Depends: debhelper (>=8.0.0), gcc (>=4.9.0), liblockfile-dev, zlib1g-dev
+Standards-Version: 3.9.7
+Section: utils
+
+Package: 4grep
+Priority: extra
+Architecture: any
+Depends: python, liblockfile1, zlib1g, ${shlibs:Depends}, ${misc:Depends}
+Description: like tgrep, but better
+ Greps over files with a persistent index and progress bar.
