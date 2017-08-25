@@ -171,7 +171,7 @@ When 4grep finishes its search, certain statistics will be recorded in 4grep's o
 ## Other Tools Used by 4grep
 
 ### Zstandard
-When storing the index files, Zstandard was chosen as the compression algorithm. The logs are currently stored after being gzipped, but we found that Zstandard performed much better. Since the file would only be compressed once, we did not care too much for this. However, Zstandard outperformed gzip significantly for compression ratios and decompression speeds. We also kept the compression level down at 8 (current max = 22) since we found that for our data, which is small data with mostly 0's, this performed best. More info at: [https://github.com/facebook/zstd](https://github.com/facebook/zstd).
+When storing the index files, Zstandard was chosen as the compression algorithm. Zstandard outperformed gzip significantly for compression ratios and decompression speeds on our index files. We also kept the compression level down at 8 (current max = 22) since we found that for our data, which is small data with mostly 0's, this performed best. More info at: [https://github.com/facebook/zstd](https://github.com/facebook/zstd).
 
 ### xxHash
 To store the index file, we decided to hash its original name into something more uniform. xxHash, developed by the same author of Zstd (Yann Collet), seemed to be the fastest and easiest to use for our program. More info at: [https://github.com/Cyan4973/xxHash](https://github.com/Cyan4973/xxHash)
