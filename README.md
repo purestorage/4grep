@@ -178,3 +178,7 @@ To store the index file, we decided to hash its original name into something mor
 
 
 ## License
+
+The full license for the project can be found [here](https://github.com/purestorage/4grep/blob/master/LICENSE).
+
+This project is licensed under the terms of the Apache-2.0 license.
